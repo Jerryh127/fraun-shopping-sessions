@@ -180,13 +180,13 @@ int main(int argc, char** argv) try {
     std::vector<size_t> order(bucketCount);
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](auto a,auto b) {
-        return buckets[a].events.size > buckets[b].events.size;
+        return buckets[a].eventCount() > buckets[b].eventCount();
     });
     const unsigned aggregators = static_cast<unsigned>(std::min<size_t>(workers, bucketCount));
     std::vector<Result> results(aggregators);
     // About one output row per nine events; reserving spares regrowth copies.
     size_t surviving = 0;
-    for (const auto& b : buckets) surviving += b.events.size;
+    for (const auto& b : buckets) surviving += b.eventCount();
     for (auto& r : results) r.users.reserve(surviving / aggregators / 4 + 1024);
     std::atomic<size_t> nextBucket{0};
     parallel(aggregators, aggregators, [&](size_t w) {

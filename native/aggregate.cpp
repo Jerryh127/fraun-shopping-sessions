@@ -22,7 +22,7 @@ struct Group {
 };
 
 // Sessions need only the times. The few purchases travel separately.
-struct Purchase {
+struct Sale {
     int64_t ts;
     uint32_t price, category, group;
 };
@@ -129,7 +129,7 @@ void sortKeys(std::vector<uint64_t>& keys, unsigned bits) {
 struct Grouped {
     std::vector<Group> groups;
     std::vector<uint64_t> keys;       // group << timeBits | (ts - origin)
-    std::vector<Purchase> purchases;  // ordered by group, then time
+    std::vector<Sale> purchases;      // ordered by group, then time
     std::vector<TimedClick> clicks;
     std::vector<uint32_t> owners;
     int64_t origin = 0;
@@ -137,14 +137,14 @@ struct Grouped {
 };
 
 void groupRows(const Bucket& bucket, Grouped& out) {
-    if (bucket.events.size >= absent || bucket.clicks.size >= absent)
+    if (bucket.eventCount() >= absent || bucket.clicks.size >= absent)
         throw std::runtime_error("Too many rows in one bucket");
     auto& groups = out.groups;
     groups.clear();
     out.purchases.clear();
     PersonIndex index(groups);
-    out.keys.resize(bucket.events.size);
-    out.owners.resize(std::max(bucket.events.size, bucket.clicks.size));
+    out.keys.resize(bucket.eventCount());
+    out.owners.resize(std::max(bucket.eventCount(), bucket.clicks.size));
     int64_t low = INT64_MAX, high = INT64_MIN;
     size_t at = 0;
     bucket.events.each([&](const Event& e) {
@@ -154,7 +154,15 @@ void groupRows(const Bucket& bucket, Grouped& out) {
         ++groups[g].eventEnd;
         low = std::min(low, e.ts);
         high = std::max(high, e.ts);
-        if (e.price) out.purchases.push_back({e.ts, e.price, e.category, g});
+    });
+    bucket.purchases.each([&](const Purchase& e) {
+        const uint32_t g = index.add(e.person);
+        out.owners[at] = g;
+        out.keys[at++] = static_cast<uint64_t>(e.ts);
+        ++groups[g].eventEnd;
+        low = std::min(low, e.ts);
+        high = std::max(high, e.ts);
+        out.purchases.push_back({e.ts, e.price, e.category, g});
     });
     out.origin = low;
     out.timeBits = std::bit_width(static_cast<uint64_t>(high) - static_cast<uint64_t>(low));
@@ -164,7 +172,7 @@ void groupRows(const Bucket& bucket, Grouped& out) {
         out.keys[i] = (out.timeBits == 64 ? 0 : uint64_t{out.owners[i]} << out.timeBits)
                       | (out.keys[i] - static_cast<uint64_t>(low));
     sortKeys(out.keys, bits);
-    std::sort(out.purchases.begin(), out.purchases.end(), [](const Purchase& a, const Purchase& b) {
+    std::sort(out.purchases.begin(), out.purchases.end(), [](const Sale& a, const Sale& b) {
         return a.group != b.group ? a.group < b.group : a.ts < b.ts;
     });
 
@@ -233,7 +241,7 @@ int32_t utcDay(int64_t ts) {
 }  // namespace
 
 void aggregate(Bucket& bucket, Result& result, size_t categoryCount, size_t campaignCount) {
-    if (!bucket.events.size) return;
+    if (!bucket.eventCount()) return;
     // Scratch space is kept per thread: buckets are alike in size, and reusing
     // it spares the allocator and the kernel a round trip per bucket.
     static thread_local Grouped grouped;

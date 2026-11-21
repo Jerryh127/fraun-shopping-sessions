@@ -306,7 +306,8 @@ struct Context {
     uint32_t campaign(Key id) const { return campaigns.find(id); }
 };
 
-struct Event { Key person; int64_t ts; uint32_t price, category; };
+struct Event { Key person; int64_t ts; };   // a view or cart
+struct Purchase { Key person; int64_t ts; uint32_t price, category; };
 struct Click { Key person, id; int64_t ts; uint32_t campaign; };
 // A bucket's rows stay in the blocks the ingest wrote them to.
 template<class T> struct Pieces {
@@ -318,7 +319,12 @@ template<class T> struct Pieces {
             for (size_t i = 0; i < count; ++i) visit(rows[i]);
     }
 };
-struct Bucket { Pieces<Event> events; Pieces<Click> clicks; };
+struct Bucket {
+    Pieces<Event> events;
+    Pieces<Purchase> purchases;
+    Pieces<Click> clicks;
+    size_t eventCount() const { return events.size + purchases.size; }
+};
 struct UserRow { Key person; int32_t day; uint32_t sessions, events; int64_t revenue; uint32_t top; };
 struct CampaignStats { int64_t sessions=0, purchasing=0, revenue=0, assists=0; };
 struct Result {

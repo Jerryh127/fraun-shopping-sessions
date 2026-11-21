@@ -246,8 +246,11 @@ public:
 
 // ---- Rows ----------------------------------------------------------------
 // A parsed event waits under its raw user ID until identities are known.
-struct StagedEvent { Key user; int64_t ts; uint32_t price, category; };
-static_assert(sizeof(StagedEvent) == 32 && sizeof(Event) == 32 && sizeof(Click) == 48);
+// Views and carts carry only a time; the few purchases have a stream of their own.
+struct StagedEvent { Key user; int64_t ts; };
+struct StagedPurchase { Key user; int64_t ts; uint32_t price, category; };
+static_assert(sizeof(StagedEvent) == 24 && sizeof(Event) == 24 && sizeof(StagedPurchase) == 32 &&
+              sizeof(Purchase) == 32 && sizeof(Click) == 48);
 
 // Every well-formed copy of an event, valid or not, leaves one of these under
 // its event_id. `staged` locates the copy's StagedEvent, if it has one.
@@ -255,26 +258,30 @@ struct IdRecord { Key id; int64_t ingest; uint64_t staged; };
 static_assert(sizeof(IdRecord) == 32);
 constexpr uint64_t notStaged = ~uint64_t{0};
 constexpr unsigned stagedPartShift = 32, stagedReaderShift = 48;
+constexpr uint64_t stagedPurchase = uint64_t{1} << 62;   // readers stay below 64, so no ref is all ones
 
 struct Reader {
     Slab slab;
     Scatter<StagedEvent, 8> events;
+    Scatter<StagedPurchase, 8> purchases;
     Scatter<Click, 4> clicks;
     Scatter<IdRecord, 4> ids;
-    Reader(size_t parts, size_t idShards) : events(slab, parts), clicks(slab, parts), ids(slab, idShards) {}
+    Reader(size_t parts, size_t idShards)
+        : events(slab, parts), purchases(slab, parts), clicks(slab, parts), ids(slab, idShards) {}
 };
 struct Router {
     Slab slab;
     Scatter<Event, 8> events;
+    Scatter<Purchase, 8> purchases;
     Scatter<Click, 4> clicks;
-    explicit Router(size_t buckets) : events(slab, buckets), clicks(slab, buckets) {}
+    explicit Router(size_t buckets) : events(slab, buckets), purchases(slab, buckets), clicks(slab, buckets) {}
 };
 
 struct ParsedEvent {
     Key id;
     int64_t ingest;
     bool valid = false;
-    StagedEvent row;
+    StagedPurchase row;   // price 0: a view or cart
 };
 
 // Malformed lines and empty IDs never take part in deduplication. Every other
@@ -333,8 +340,10 @@ void deduplicate(size_t shard, unsigned shardBits, std::vector<std::unique_ptr<R
     constexpr size_t perBlock = rowsPerBlock<IdRecord>;
     auto drop = [&](uint64_t staged) {
         if (staged == notStaged) return;
-        readers[staged >> stagedReaderShift]->events
-            .at((staged >> stagedPartShift) & 0xFFFF, staged & 0xFFFFFFFFu).ts = invalidTime;
+        Reader& reader = *readers[(staged >> stagedReaderShift) & 0xFF];
+        const size_t part = (staged >> stagedPartShift) & 0xFFFF, index = staged & 0xFFFFFFFFu;
+        if (staged & stagedPurchase) reader.purchases.at(part, index).ts = invalidTime;
+        else reader.events.at(part, index).ts = invalidTime;
     };
     for (auto& r : readers)
         r->ids.pieces(shard, [&](IdRecord* records, size_t n) {
@@ -484,8 +493,9 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
                     uint64_t staged = notStaged;
                     if (event.valid) {
                         const size_t part = partOf(event.row.user.hash());
-                        staged = (uint64_t(r) << stagedReaderShift) | (uint64_t(part) << stagedPartShift)
-                                 | reader.events.add(part, event.row);
+                        staged = (uint64_t(r) << stagedReaderShift) | (uint64_t(part) << stagedPartShift);
+                        if (event.row.price) staged |= stagedPurchase | reader.purchases.add(part, event.row);
+                        else staged |= reader.events.add(part, StagedEvent{event.row.user, event.row.ts});
                     }
                     reader.ids.add(event.id.hash() & (idShards - 1), IdRecord{event.id, event.ingest, staged});
                 });
@@ -497,6 +507,7 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
             }
         }
         reader.events.finish();
+        reader.purchases.finish();
         reader.clicks.finish();
         reader.ids.finish();
     });
@@ -531,8 +542,16 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
                         const StagedEvent& row = rows[i];
                         if (row.ts == invalidTime) continue;
                         const Key person = ctx.person(row.user);
-                        router.events.add(person.hash() & bucketMask,
-                                          Event{person, row.ts, row.price, row.category});
+                        router.events.add(person.hash() & bucketMask, Event{person, row.ts});
+                    }
+                });
+                reader->purchases.pieces(p, [&](const StagedPurchase* rows, size_t n) {
+                    for (size_t i = 0; i < n; ++i) {
+                        const StagedPurchase& row = rows[i];
+                        if (row.ts == invalidTime) continue;
+                        const Key person = ctx.person(row.user);
+                        router.purchases.add(person.hash() & bucketMask,
+                                             Purchase{person, row.ts, row.price, row.category});
                     }
                 });
                 reader->clicks.pieces(p, [&](const Click* rows, size_t n) {
@@ -543,16 +562,19 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
                     }
                 });
                 reader->events.release(p, spent);
+                reader->purchases.release(p, spent);
                 reader->clicks.release(p, spent);
             }
             recycled.give(spent);
         }
         router.events.finish();
+        router.purchases.finish();
         router.clicks.finish();
     });
     for (size_t b = 0; b < out.size(); ++b)
         for (auto& router : routers) {
             router->events.pieces(b, [&](const Event* rows, size_t n) { out[b].events.add(rows, n); });
+            router->purchases.pieces(b, [&](const Purchase* rows, size_t n) { out[b].purchases.add(rows, n); });
             router->clicks.pieces(b, [&](const Click* rows, size_t n) { out[b].clicks.add(rows, n); });
         }
     // The blocks outlive this function: buckets point into them.
