@@ -78,8 +78,15 @@ struct alignas(8) Key {
         return static_cast<uint64_t>(product) ^ static_cast<uint64_t>(product >> 64);
     }
     bool operator==(const Key& other) const {
-        if (!isLong()) return data == other.data;
-        return other.isLong() && view() == other.view();
+        uint64_t a0, a1, b0, b1;
+        std::memcpy(&a0, data.data(), 8);
+        std::memcpy(&a1, data.data() + 8, 8);
+        std::memcpy(&b0, other.data.data(), 8);
+        std::memcpy(&b1, other.data.data() + 8, 8);
+        // Short keys are canonical, so equal text means equal bytes. Long keys
+        // with equal bytes share one address and length.
+        if (((a0 ^ b0) | (a1 ^ b1)) == 0) return true;
+        return isLong() && other.isLong() && view() == other.view();
     }
     bool operator<(const Key& other) const {
         if (!isLong() && !other.isLong()) return std::memcmp(data.data(), other.data.data(), 16) < 0;

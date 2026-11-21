@@ -12,7 +12,6 @@
 #include <memory>
 #include <stdexcept>
 #include <string_view>
-#include <tuple>
 #include <vector>
 #include <chrono>
 #include <iostream>
@@ -106,18 +105,15 @@ template<class F> void chunkLines(const InputChunk& chunk, F&& visit) {
         pos += newline + 1;
     }
     // Newlines are found 64 bytes at a time; `pos` is the open line's start.
+    // 256-bit operations only: the same code runs on the scorer and under
+    // emulation, and the cores never enter an AVX-512 frequency licence.
     auto newlinesIn = [](const char* p) -> uint64_t {
-#ifdef __AVX512BW__
-        return _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(reinterpret_cast<const void*>(p)),
-                                      _mm512_set1_epi8('\n'));
-#else   // local builds for emulators without AVX-512
         const __m256i newline = _mm256_set1_epi8('\n');
         const uint32_t a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)), newline));
         const uint32_t b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p + 32)), newline));
         return a | (uint64_t{b} << 32);
-#endif
     };
     size_t scan = pos;
     while (pos < chunk.end) {
@@ -219,17 +215,10 @@ public:
         Buffer& buffer = buffers[part];
         buffer.rows[slot] = row;
         if (slot == Group - 1) {
-#ifdef __AVX512F__
-            auto* from = reinterpret_cast<const __m512i*>(&buffer);
-            auto* to = reinterpret_cast<__m512i*>(destination(part, index - slot));
-            for (size_t i = 0; i < Group * sizeof(T) / 64; ++i)
-                _mm512_stream_si512(to + i, _mm512_load_si512(from + i));
-#else
             auto* from = reinterpret_cast<const __m256i*>(&buffer);
             auto* to = reinterpret_cast<__m256i*>(destination(part, index - slot));
             for (size_t i = 0; i < Group * sizeof(T) / 32; ++i)
                 _mm256_stream_si256(to + i, _mm256_load_si256(from + i));
-#endif
         }
         return index;
     }
@@ -257,21 +246,21 @@ public:
 
 // ---- Rows ----------------------------------------------------------------
 // A parsed event waits under its raw user ID until identities are known.
-// `offset` leads back to the source line if its event_id turns out not to be unique.
-struct StagedEvent { Key user; int64_t ts; uint32_t price, category; uint64_t offset; };
-static_assert(sizeof(StagedEvent) == 40 && sizeof(Event) == 32 && sizeof(Click) == 48);
+struct StagedEvent { Key user; int64_t ts; uint32_t price, category; };
+static_assert(sizeof(StagedEvent) == 32 && sizeof(Event) == 32 && sizeof(Click) == 48);
 
-// Dedup record: 23 hash bits, then either the line's offset or the staged row.
-constexpr unsigned refBits = 40, indexBits = 26, partBitsMax = 10, readerBitsMax = 4;
-constexpr uint64_t stagedFlag = uint64_t{1} << refBits;
-constexpr unsigned tagShift = refBits + 1;
-static_assert(indexBits + partBitsMax + readerBitsMax == refBits);
+// Every well-formed copy of an event, valid or not, leaves one of these under
+// its event_id. `staged` locates the copy's StagedEvent, if it has one.
+struct IdRecord { Key id; int64_t ingest; uint64_t staged; };
+static_assert(sizeof(IdRecord) == 32);
+constexpr uint64_t notStaged = ~uint64_t{0};
+constexpr unsigned stagedPartShift = 32, stagedReaderShift = 48;
 
 struct Reader {
     Slab slab;
     Scatter<StagedEvent, 8> events;
     Scatter<Click, 4> clicks;
-    Scatter<uint64_t, 8> ids;
+    Scatter<IdRecord, 4> ids;
     Reader(size_t parts, size_t idShards) : events(slab, parts), clicks(slab, parts), ids(slab, idShards) {}
 };
 struct Router {
@@ -283,9 +272,9 @@ struct Router {
 
 struct ParsedEvent {
     Key id;
+    int64_t ingest;
     bool valid = false;
     StagedEvent row;
-    std::string_view ingest;
 };
 
 // Malformed lines and empty IDs never take part in deduplication. Every other
@@ -294,29 +283,25 @@ inline bool parseEvent(std::string_view line, const Context& ctx, ParsedEvent& o
     std::array<std::string_view,7> f;
     if (!csv(line, f) || f[0].empty()) return false;
     out.id = Key::from(f[0]);
-    out.ingest = f[3];
+    out.ingest = f[3].size() == 20 ? validIngest(f[3].data()) : timestamp(f[3]);
     out.valid = false;
     if (f[1].empty() || f[5].empty()) return true;
     const auto ts = timestamp(f[2]);
-    if (ts < ctx.start || ts >= ctx.end) return true;
-    const int64_t ingest = f[3].size() == 20 ? validIngest(f[3].data()) : timestamp(f[3]);
-    if (ingest - dayMs > ts) return true;
+    if (ts < ctx.start || ts >= ctx.end || out.ingest - dayMs > ts) return true;
     uint32_t price = 0, category = 0;
-    if (f[4] == "purchase") {
+    if (f[4].size() == 8 && std::memcmp(f[4].data(), "purchase", 8) == 0) {
         auto priceEnd = f[6].data() + f[6].size();
         auto [end, error] = std::from_chars(f[6].data(), priceEnd, price);
         if (error != std::errc{} || end != priceEnd || price == 0 || price > 10'000'000)
             return true;
         category = ctx.category(Key::from(f[5]));
-    } else if (f[4] != "view" && f[4] != "cart") {
+    } else if (f[4].size() != 4 || (std::memcmp(f[4].data(), "view", 4) != 0 &&
+                                    std::memcmp(f[4].data(), "cart", 4) != 0)) {
         return true;
     }
-    out.row = {Key::from(f[1]), ts, price, category, 0};
+    out.row = {Key::from(f[1]), ts, price, category};
     out.valid = true;
     return true;
-}
-inline int64_t ingestTime(std::string_view text) {
-    return text.size() == 20 ? validIngest(text.data()) : timestamp(text);
 }
 
 inline bool parseClick(std::string_view line, const Context& ctx, Click& row) {
@@ -330,136 +315,120 @@ inline bool parseClick(std::string_view line, const Context& ctx, Click& row) {
     return true;
 }
 
-struct Source {
-    std::vector<InputChunk> spans;
-    std::vector<uint64_t> starts;            // global offset of each event file
-    std::vector<std::string_view> files;
-    size_t eventSpans = 0;
-    // The line's first byte and the end of its file.
-    std::pair<const char*, const char*> locate(uint64_t offset) const {
-        const size_t f = std::upper_bound(starts.begin(), starts.end(), offset) - starts.begin() - 1;
-        return {files[f].data() + (offset - starts[f]), files[f].data() + files[f].size()};
-    }
-};
-
-// One ID shard: find the hash tags that occur more than once, then settle
-// those few rows exactly from their source lines.
-void deduplicate(size_t shard, const Context& ctx, const Source& source,
-                 std::vector<std::unique_ptr<Reader>>& readers) {
+// One ID shard. Of the copies sharing an event_id only the earliest ingested
+// keeps its staged row; copies that tie are identical, so any one may stay.
+// Tags keep almost all probes inside the slot array, and every potential
+// match compares the complete ID.
+void deduplicate(size_t shard, unsigned shardBits, std::vector<std::unique_ptr<Reader>>& readers) {
     size_t count = 0;
     for (auto& r : readers) count += r->ids.counts[shard];
     if (count < 2) return;
-    static thread_local std::vector<uint32_t> slots;
-    const size_t capacity = std::bit_ceil(2 * count);
-    const size_t mask = capacity - 1;
-    slots.assign(capacity, 0);
-    constexpr uint32_t repeated = 1u << 31;
+    if (count >> 31) throw std::runtime_error("Too many rows in one ID shard");
+    struct Slot { uint32_t tag, index; };
+    static thread_local std::vector<Slot> slots;
+    static thread_local std::vector<IdRecord*> blocks;
+    const size_t mask = std::bit_ceil(2 * count) - 1;
+    slots.assign(mask + 1, Slot{0, 0});
+    blocks.clear();
+    constexpr size_t perBlock = rowsPerBlock<IdRecord>;
+    auto drop = [&](uint64_t staged) {
+        if (staged == notStaged) return;
+        readers[staged >> stagedReaderShift]->events
+            .at((staged >> stagedPartShift) & 0xFFFF, staged & 0xFFFFFFFFu).ts = invalidTime;
+    };
     for (auto& r : readers)
-        r->ids.pieces(shard, [&](const uint64_t* records, size_t n) {
+        r->ids.pieces(shard, [&](IdRecord* records, size_t n) {
+            const uint32_t base = static_cast<uint32_t>(blocks.size() * perBlock);
+            blocks.push_back(records);
             for (size_t i = 0; i < n; ++i) {
-                const uint32_t tag = static_cast<uint32_t>(records[i] >> tagShift);
-                const uint32_t key = (tag << 1) | 1;
-                size_t pos = (tag * 0x9E3779B1u >> 7) & mask;
-                for (;;) {
-                    const uint32_t slot = slots[pos];
-                    if (!slot) { slots[pos] = key; break; }
-                    if ((slot & ~repeated) == key) { slots[pos] = slot | repeated; break; }
-                    pos = (pos + 1) & mask;
+                IdRecord& record = records[i];
+                const uint64_t hash = record.id.hash();
+                const uint32_t tag = static_cast<uint32_t>(hash >> 32);
+                size_t pos = (hash >> shardBits) & mask;
+                for (;; pos = (pos + 1) & mask) {
+                    Slot& slot = slots[pos];
+                    if (!slot.index) {
+                        slot = {tag, base + static_cast<uint32_t>(i) + 1};
+                        break;
+                    }
+                    if (slot.tag != tag) continue;
+                    IdRecord& kept = blocks[(slot.index - 1) / perBlock][(slot.index - 1) % perBlock];
+                    if (!(kept.id == record.id)) continue;
+                    if (record.ingest < kept.ingest) {
+                        drop(kept.staged);
+                        slot.index = base + static_cast<uint32_t>(i) + 1;
+                    } else {
+                        drop(record.staged);
+                    }
+                    break;
                 }
             }
         });
-    std::vector<uint64_t> suspects;
-    for (auto& r : readers)
-        r->ids.pieces(shard, [&](const uint64_t* records, size_t n) {
-            for (size_t i = 0; i < n; ++i) {
-                const uint32_t tag = static_cast<uint32_t>(records[i] >> tagShift);
-                const uint32_t key = (tag << 1) | 1;
-                size_t pos = (tag * 0x9E3779B1u >> 7) & mask;
-                while ((slots[pos] & ~repeated) != key) pos = (pos + 1) & mask;
-                if (slots[pos] & repeated) suspects.push_back(records[i]);
-            }
-        });
-    if (suspects.empty()) return;
-    std::sort(suspects.begin(), suspects.end());
+}
+} // namespace
 
-    // The suspects' staged rows and source lines are scattered through memory.
-    // Resolve them in waves so those cache misses overlap.
-    struct Copy { std::string_view id; int64_t ingest; StagedEvent* staged; const char* line; const char* limit; };
-    std::vector<Copy> copies(suspects.size());
-    constexpr size_t wave = 64;
-    for (size_t base = 0; base < suspects.size(); base += wave) {
-        const size_t stop = std::min(suspects.size(), base + wave);
-        for (size_t i = base; i < stop; ++i) {
-            const uint64_t record = suspects[i];
-            const uint64_t ref = record & (stagedFlag - 1);
-            copies[i].staged = nullptr;
-            if (record & stagedFlag) {
-                const size_t reader = ref >> (indexBits + partBitsMax);
-                const size_t part = (ref >> indexBits) & ((1u << partBitsMax) - 1);
-                copies[i].staged = &readers[reader]->events.at(part, ref & ((1u << indexBits) - 1));
-                __builtin_prefetch(copies[i].staged);
-                __builtin_prefetch(reinterpret_cast<const char*>(copies[i].staged) + 39);
-            } else {
-                std::tie(copies[i].line, copies[i].limit) = source.locate(ref);
-                __builtin_prefetch(copies[i].line);
-                __builtin_prefetch(copies[i].line + 64);
-            }
-        }
-        for (size_t i = base; i < stop; ++i)
-            if (copies[i].staged) {
-                std::tie(copies[i].line, copies[i].limit) = source.locate(copies[i].staged->offset);
-                __builtin_prefetch(copies[i].line);
-                __builtin_prefetch(copies[i].line + 64);
-            }
-        for (size_t i = base; i < stop; ++i) {
-            std::array<std::string_view,7> f;
-            const char* start = copies[i].line;
-            const void* newline = std::memchr(start, '\n', copies[i].limit - start);
-            const char* stop = newline ? static_cast<const char*>(newline) : copies[i].limit;
-            if (!csv(std::string_view(start, stop - start), f)) throw std::logic_error("Source line changed");
-            copies[i].id = f[0];
-            copies[i].ingest = ingestTime(f[3]);
-        }
+namespace {
+// Eight ASCII digits, most significant first.
+inline bool eightDigits(const char* p, uint64_t& value) {
+    uint64_t x;
+    std::memcpy(&x, p, 8);
+    constexpr uint64_t highs = 0xF0F0F0F0F0F0F0F0ull, threes = 0x3030303030303030ull;
+    // Every byte is 0x30..0x3F, so adding six cannot carry between bytes.
+    if ((x & highs) != threes || ((x + 0x0606060606060606ull) & highs) != threes) return false;
+    x = (x & 0x0F0F0F0F0F0F0F0Full) * 2561 >> 8;
+    x = (x & 0x00FF00FF00FF00FFull) * 6553601 >> 16;
+    value = (x & 0x0000FFFF0000FFFFull) * 42949672960001ull >> 32;
+    return true;
+}
+
+// Digits only, any number of leading zeros; too large for 64 bits is invalid
+// (and would lie outside every window anyway).
+inline int64_t epochDigits(std::string_view s) {
+    const char* p = s.data();
+    const size_t size = s.size();
+    if (size > 16) {
+        int64_t ms;
+        if (!digit(*p)) return invalidTime;
+        auto [end, ec] = std::from_chars(p, p + size, ms);
+        return ec == std::errc{} && end == p + size ? ms : invalidTime;
     }
-    // Within each exact ID the earliest ingest survives. Copies that tie are identical.
-    auto before = [](const Copy& a, const Copy& b) {
-        return a.id != b.id ? a.id < b.id : a.ingest < b.ingest;
-    };
-    for (size_t begin = 0; begin < suspects.size();) {
-        size_t end = begin + 1;
-        while (end < suspects.size() && suspects[end] >> tagShift == suspects[begin] >> tagShift) ++end;
-        if (end - begin <= 16) {
-            for (size_t i = begin + 1; i < end; ++i) {
-                Copy value = copies[i];
-                size_t hole = i;
-                for (; hole > begin && before(value, copies[hole - 1]); --hole) copies[hole] = copies[hole - 1];
-                copies[hole] = value;
-            }
-        } else {
-            std::stable_sort(copies.begin() + begin, copies.begin() + end, before);
-        }
-        for (size_t i = begin + 1; i < end; ++i)
-            if (copies[i].id == copies[i - 1].id && copies[i].staged)
-                copies[i].staged->ts = invalidTime;
-        begin = end;
+    uint64_t head = 0, tail = 0;
+    size_t lead = size;
+    if (size >= 8) {
+        lead = size - 8;
+        if (!eightDigits(p + lead, tail)) return invalidTime;
     }
+    for (size_t i = 0; i < lead; ++i) {
+        const unsigned d = static_cast<unsigned char>(p[i]) - '0';
+        if (d > 9) return invalidTime;
+        head = head * 10 + d;
+    }
+    if (size == 0) return invalidTime;
+    return static_cast<int64_t>(size >= 8 ? head * 100000000ull + tail : head);
+}
+
+// "HH:MM:SS" as seconds since midnight, or -1.
+inline int clock(const char* p) {
+    uint64_t x;
+    std::memcpy(&x, p, 8);
+    x ^= 0x30303A30303A3030ull;
+    // Digit bytes must now be 0..9 and the colons zero. With every digit
+    // byte below sixteen the addition cannot carry.
+    if ((x | (x + 0x0606000606000606ull)) & 0xF0F0FFF0F0FFF0F0ull) return -1;
+    const unsigned hour = (x & 0xFF) * 10 + (x >> 8 & 0xFF);
+    const unsigned min = (x >> 24 & 0xFF) * 10 + (x >> 32 & 0xFF);
+    const unsigned sec = (x >> 48 & 0xFF) * 10 + (x >> 56);
+    if (hour > 23 || min > 59 || sec > 59) return -1;
+    return static_cast<int>(3600 * hour + 60 * min + sec);
 }
 } // namespace
 
 int64_t timestamp(std::string_view s) {
     const char* p = s.data();
-    if ((s.size() != 20 && s.size() != 25) || p[4] != '-') {
-        int64_t ms;
-        if (s.empty() || !digit(*p)) return invalidTime;
-        auto [end, ec] = std::from_chars(p, p + s.size(), ms);
-        return ec == std::errc{} && end == p + s.size() ? ms : invalidTime;
-    }
+    if ((s.size() != 20 && s.size() != 25) || p[4] != '-') return epochDigits(s);
     const auto base = midnight(p);
-    if (base == invalidTime || p[10] != 'T' || p[13] != ':' || p[16] != ':' ||
-        !digit(p[11]) || !digit(p[12]) || !digit(p[14]) || !digit(p[15]) ||
-        !digit(p[17]) || !digit(p[18])) return invalidTime;
-    const int hour = pairValue(p+11), min = pairValue(p+14), sec = pairValue(p+17);
-    if (hour > 23 || min > 59 || sec > 59) return invalidTime;
+    const int seconds = clock(p + 11);
+    if (base == invalidTime || p[10] != 'T' || seconds < 0) return invalidTime;
     int offset = 0;
     if (s.size() == 25) {
         if ((p[19] != '+' && p[19] != '-') || p[22] != ':' || !digit(p[20]) ||
@@ -470,46 +439,34 @@ int64_t timestamp(std::string_view s) {
     } else if (p[19] != 'Z') {
         return invalidTime;
     }
-    return base + 1000LL * (3600 * hour + 60 * (min - offset) + sec);
+    return base + 1000LL * (seconds - 60 * offset);
 }
-
 
 void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
             const std::vector<std::string_view>& clickFiles, std::vector<Bucket>& out,
             unsigned workers, const std::function<void()>& awaitIdentities) {
     if (!std::has_single_bit(out.size())) throw std::logic_error("Bucket count must be a power of two");
     lap("start");
-    workers = std::min(workers, 1u << readerBitsMax);
+    workers = std::min(workers, 64u);
 
-    Source source;
-    source.files = eventFiles;
+    auto spans = chunks(eventFiles);
+    const size_t eventSpans = spans.size();
     size_t bytes = 0;
-    for (auto file : eventFiles) {
-        source.starts.push_back(bytes);
-        bytes += file.size();
-    }
-    if (bytes >> refBits) throw std::runtime_error("Event input too large");
-    source.spans = chunks(eventFiles);
-    source.eventSpans = source.spans.size();
-    for (auto& span : chunks(clickFiles)) source.spans.push_back(span);
-    if (source.spans.empty()) { awaitIdentities(); return; }
-    std::vector<uint64_t> spanStart(source.eventSpans);
-    for (size_t i = 0, f = 0; i < source.eventSpans; ++i) {
-        while (source.files[f].data() != source.spans[i].file.data() ||
-               source.files[f].size() != source.spans[i].file.size()) ++f;
-        spanStart[i] = source.starts[f];
-    }
+    for (auto file : eventFiles) bytes += file.size();
+    for (auto& span : chunks(clickFiles)) spans.push_back(span);
+    if (spans.empty()) { awaitIdentities(); return; }
 
     // Staging partitions follow the top hash bits, like the identity table, so
     // one partition later probes one slice of it. ID shards use the low bits.
     size_t clickBytes = 0;
     for (auto file : clickFiles) clickBytes += file.size();
     const unsigned partBits = std::clamp<int>(std::bit_width((bytes + clickBytes) >> 23), 0, 9);
+    const unsigned idShardBits = std::countr_zero(std::clamp<size_t>(std::bit_ceil(bytes >> 22), 1, 1024));
     const size_t parts = size_t{1} << partBits;
-    const size_t idShards = std::clamp<size_t>(std::bit_ceil(bytes >> 22), 1, 1024);
+    const size_t idShards = size_t{1} << idShardBits;
     auto partOf = [&](uint64_t hash) { return static_cast<size_t>((hash >> 1) >> (63 - partBits)); };
 
-    const unsigned readerCount = static_cast<unsigned>(std::min<size_t>(source.spans.size(), workers));
+    const unsigned readerCount = static_cast<unsigned>(std::min<size_t>(spans.size(), workers));
     std::vector<std::unique_ptr<Reader>> readers(readerCount);
     std::atomic<size_t> next = 0;
     parallel(readerCount, readerCount, [&](size_t r) {
@@ -519,25 +476,18 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
         Click click;
         for (;;) {
             const size_t i = next.fetch_add(1, std::memory_order_relaxed);
-            if (i >= source.spans.size()) break;
-            const InputChunk& span = source.spans[i];
-            if (i < source.eventSpans) {
-                const uint64_t base = spanStart[i] - reinterpret_cast<uintptr_t>(span.file.data());
+            if (i >= spans.size()) break;
+            const InputChunk& span = spans[i];
+            if (i < eventSpans) {
                 chunkLines(span, [&](std::string_view line) {
                     if (!parseEvent(line, ctx, event)) return;
-                    const uint64_t offset = base + reinterpret_cast<uintptr_t>(line.data());
-                    const uint64_t hash = event.id.hash();
-                    uint64_t record = offset;
+                    uint64_t staged = notStaged;
                     if (event.valid) {
-                        event.row.offset = offset;
                         const size_t part = partOf(event.row.user.hash());
-                        const uint64_t index = reader.events.add(part, event.row);
-                        if (index >> indexBits) throw std::runtime_error("Too many rows in one partition");
-                        record = stagedFlag | (uint64_t(r) << (indexBits + partBitsMax)) |
-                                 (uint64_t(part) << indexBits) | index;
+                        staged = (uint64_t(r) << stagedReaderShift) | (uint64_t(part) << stagedPartShift)
+                                 | reader.events.add(part, event.row);
                     }
-                    record |= (hash >> 32) << tagShift;
-                    reader.ids.add(hash & (idShards - 1), record);
+                    reader.ids.add(event.id.hash() & (idShards - 1), IdRecord{event.id, event.ingest, staged});
                 });
             } else {
                 chunkLines(span, [&](std::string_view line) {
@@ -553,7 +503,7 @@ void ingest(const Context& ctx, const std::vector<std::string_view>& eventFiles,
     lap("parse");
 
     parallel(idShards, workers, [&](size_t shard) {
-        deduplicate(shard, ctx, source, readers);
+        deduplicate(shard, idShardBits, readers);
         std::vector<void*> spent;
         for (auto& reader : readers) reader->ids.release(shard, spent);
         recycled.give(spent);

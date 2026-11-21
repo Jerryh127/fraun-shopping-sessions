@@ -74,5 +74,20 @@ Same rules, same `output.cpp`; `ingest.cpp`, `aggregate.cpp`, `main.cpp`, `links
 Measured on a 2-core Sapphire Rapids VM, seed 3, 20M events, CSV output stub
 (`scripts/csv_harness`), Parquet stage excluded: 7.95 s → 3.89 s on one core,
 4.25 s → 2.37 s on two. Output identical to the previous engine on seeds 3, 7, 11, 23, 42, 99;
-all 36 fixtures and the seed-1 dev answer match. Not yet run through Docker with the Arrow
-writer, and not yet timed on 8 vCPUs.
+all 36 fixtures and the seed-1 dev answer match. 
+
+## Round 2: no Arrow, lighter dedup
+
+- **Parquet** is written by `native/output.cpp` itself (uncompressed, PLAIN, one v1 page per
+  column chunk; `sessions`/`events` in `user_daily` are INT32). The binary links statically and
+  the image no longer contains Arrow. `scripts/csv_harness/check_parquet.py` is an independent
+  reader used to check the files where polars is unavailable; polars via `make fixtures` is the
+  real test.
+- **Dedup** records carry the event ID and ingest time (32 bytes), so duplicates are settled in
+  one pass without re-reading source lines.
+- **Timestamps**: SWAR digit and clock parsing instead of `from_chars` and per-digit checks.
+- **256-bit only**: the AVX-512 paths are gone. The Cascade Lake build and the Haswell build used
+  under emulation now run the same source paths.
+
+Same VM and dataset as above, end to end including Parquet: 3.75 s on one core, 2.09 s on two
+(previous engine: 7.95 s and 4.25 s before its Parquet stage).

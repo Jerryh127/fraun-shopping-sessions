@@ -3,7 +3,8 @@
 This is Fraun's working repository for the Builders × Databricks Shopping
 Sessions track. The active submission engine is the C++20 implementation under
 `native/`. It uses memory-mapped input, SIMD CSV parsing, compact keys,
-parallel deduplication and direct Parquet output. The authoritative specification
+parallel deduplication and its own Parquet writer; the image holds one static binary
+and no third-party library. The authoritative specification
 is `RULES.md`; benchmark history is in `STRATEGY.md`.
 
 If this starter and `rules.md` ever disagree, `rules.md` wins. Ask the organizers if `rules.md` leaves you unsure.
