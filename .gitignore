@@ -1,0 +1,11 @@
+dev/
+out/
+.venv/
+.cargo/
+.rustup/
+tools/generator/target/
+cleaner/target/
+__pycache__/
+*.pyc
+.DS_Store
+

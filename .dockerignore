@@ -1,0 +1,12 @@
+fixtures/
+dev/
+out/
+*.md
+.git
+.venv/
+.cargo/
+.rustup/
+cleaner/
+pipeline/
+scripts/
+tools/
